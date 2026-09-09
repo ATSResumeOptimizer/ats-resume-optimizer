@@ -71,7 +71,7 @@ def _handle_unexpected(exc: Exception, endpoint: str) -> None:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=(
                 "LLM provider authentication failed. "
-                "Check your API key (OPENROUTER_API_KEY / OPENAI_API_KEY / etc.) in .env."
+                "Check your API key (GEMINI_API_KEY / OPENROUTER_API_KEY / etc.) in .env."
             ),
         ) from exc
     logger.exception("Unexpected error in %s", endpoint)

@@ -11,7 +11,7 @@ Pipeline
 6. Assemble                      → OptimizeResponse
 
 All LLM calls are isolated in _llm_call() so the provider can be swapped
-(OpenAI, Azure OpenAI, Anthropic, local Ollama, etc.) by changing the
+(Gemini, OpenAI, Azure OpenAI, Anthropic, local Ollama, etc.) by changing the
 environment variables without touching the pipeline logic.
 """
 
@@ -61,12 +61,13 @@ logger = logging.getLogger(__name__)
 # LLM backend – configurable via environment variables
 # ---------------------------------------------------------------------------
 # Required env vars:
-#   LLM_PROVIDER  – "openai" (default) | "azure" | "anthropic" | "openrouter"
-#                   | "groq" | "ollama"
-#   LLM_MODEL     – model name, e.g. "gpt-4o", "openai/gpt-4o",
+#   LLM_PROVIDER  – "gemini" (default) | "openai" | "azure" | "anthropic"
+#                   | "openrouter" | "groq" | "ollama"
+#   LLM_MODEL     – model name, e.g. "gemini-flash-latest", "gpt-4o",
 #                   "claude-3-5-sonnet-20241022", "llama-3.3-70b-versatile",
 #                   "llama3.2" (Ollama)
-#   OPENAI_API_KEY / AZURE_OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY
+#   GEMINI_API_KEY / OPENAI_API_KEY / AZURE_OPENAI_API_KEY /
+#   ANTHROPIC_API_KEY / OPENROUTER_API_KEY
 #
 # Azure extras:
 #   AZURE_OPENAI_ENDPOINT   – https://<resource>.openai.azure.com/
@@ -112,12 +113,14 @@ def _llm_call(
 
     Raises RuntimeError if no provider is configured.
     """
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model = os.getenv("LLM_MODEL", "gpt-4o")
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
 
     def _dispatch() -> tuple[str, int, int]:
         """Return (text, prompt_tokens, completion_tokens)."""
-        if provider == "openai":
+        if provider == "gemini":
+            return _call_gemini(messages, model, temperature, max_tokens)
+        elif provider == "openai":
             return _call_openai(messages, model, temperature, max_tokens)
         elif provider == "azure":
             return _call_azure_openai(messages, model, temperature, max_tokens)
@@ -132,8 +135,8 @@ def _llm_call(
         else:
             raise RuntimeError(
                 f"Unknown LLM_PROVIDER '{provider}'. "
-                "Set LLM_PROVIDER to 'openai', 'azure', 'anthropic', 'openrouter', "
-                "'groq', or 'ollama'."
+                "Set LLM_PROVIDER to 'gemini', 'openai', 'azure', 'anthropic', "
+                "'openrouter', 'groq', or 'ollama'."
             )
 
     last_exc: Exception | None = None
@@ -172,6 +175,73 @@ def _llm_call(
 # Return type for all _call_* functions: (text, prompt_tokens, completion_tokens)
 # Token counts are 0 when the provider doesn't expose usage (e.g. Ollama).
 _LLMResult = tuple[str, int, int]
+
+
+def _call_gemini(
+    messages: list[dict], model: str, temperature: float, max_tokens: int
+) -> _LLMResult:
+    """Call Gemini's REST generateContent API with the existing message contract."""
+    import httpx
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set.")
+
+    system_parts: list[str] = []
+    contents: list[dict[str, object]] = []
+    for message in messages:
+        role = message["role"]
+        content = str(message["content"])
+        if role == "system":
+            system_parts.append(content)
+        else:
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append(
+                {
+                    "role": gemini_role,
+                    "parts": [{"text": content}],
+                }
+            )
+
+    payload: dict[str, object] = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json",
+        },
+    }
+    if system_parts:
+        payload["systemInstruction"] = {
+            "parts": [{"text": "\n\n".join(system_parts)}],
+        }
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent"
+    )
+    response = httpx.post(
+        endpoint,
+        headers={
+            "Content-Type": "application/json",
+            "X-goog-api-key": api_key,
+        },
+        json=payload,
+        timeout=120.0,
+    )
+    response.raise_for_status()
+    response_data = response.json()
+    candidates = response_data.get("candidates") or []
+    text = ""
+    if candidates:
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(str(part.get("text", "")) for part in parts)
+    usage = response_data.get("usageMetadata") or {}
+    return (
+        text,
+        int(usage.get("promptTokenCount", 0)),
+        int(usage.get("candidatesTokenCount", 0)),
+    )
 
 
 def _call_openai(messages: list[dict], model: str, temperature: float, max_tokens: int) -> _LLMResult:

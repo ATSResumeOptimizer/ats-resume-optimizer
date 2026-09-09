@@ -18,6 +18,7 @@ python-docx>=1.1.0
 lxml>=5.3.0
 
 # ── LLM providers ─────────────────────────────────────────────────────────────
+# Gemini uses the REST API through httpx.
 # openai SDK is used for:
 #   - LLM_PROVIDER=openai     → api.openai.com
 #   - LLM_PROVIDER=azure      → Azure OpenAI

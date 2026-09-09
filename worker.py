@@ -14,7 +14,7 @@ Environment variables
 REDIS_URL      Redis broker URL (default: redis://localhost:6379)
 DATABASE_URL   SQLAlchemy connection URL (see db.py for defaults)
 
-All LLM provider env vars (LLM_PROVIDER, LLM_MODEL, OPENROUTER_API_KEY, …)
+All LLM provider env vars (LLM_PROVIDER, LLM_MODEL, GEMINI_API_KEY, …)
 must also be set in the worker process environment — the same .env file used
 by the API server works fine.
 """
@@ -111,8 +111,8 @@ def run_job(job_id: str) -> None:
     a sentinel value of -1 for token counts until optimizer.py is updated to
     return structured responses.  See the TODO in each _record_usage call.
     """
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model = os.getenv("LLM_MODEL", "gpt-4o")
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
 
     db = SessionLocal()
     try:

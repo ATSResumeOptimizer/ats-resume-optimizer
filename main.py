@@ -3,9 +3,10 @@ ATS Resume Optimizer – FastAPI application entry point.
 
 Environment variables
 ---------------------
-LLM_PROVIDER       "openai" | "azure" | "anthropic" | "openrouter"
-                   | "groq" | "ollama"                (default: openai)
-LLM_MODEL          model name                         (default: gpt-4o)
+LLM_PROVIDER       "gemini" | "openai" | "azure" | "anthropic" | "openrouter"
+                   | "groq" | "ollama"                (default: gemini)
+LLM_MODEL          model name                         (default: gemini-flash-latest)
+GEMINI_API_KEY     required when LLM_PROVIDER=gemini
 OPENAI_API_KEY     required when LLM_PROVIDER=openai
 AZURE_OPENAI_API_KEY       ─┐
 AZURE_OPENAI_ENDPOINT       ├ required when LLM_PROVIDER=azure
@@ -70,11 +71,12 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Create DB tables on startup (idempotent — skips existing tables)
     init_db()
 
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model = os.getenv("LLM_MODEL", "gpt-4o")
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower()
+    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
 
     # Warn loudly at startup if the required API key is missing
     key_map = {
+        "gemini": "GEMINI_API_KEY",
         "openai": "OPENAI_API_KEY",
         "azure": "AZURE_OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
@@ -170,5 +172,3 @@ app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(router)
 app.include_router(router_v2)
-
-
