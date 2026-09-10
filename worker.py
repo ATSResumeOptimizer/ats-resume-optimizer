@@ -36,6 +36,8 @@ from rq import Queue  # type: ignore
 from db import SessionLocal
 from models import Job, JobStatus, UsageRecord
 from optimizer import (
+    _deterministic_ats_analysis,
+    _deterministic_rescore,
     _load_json_col,
     _step_analyse_jd,
     _step_ats_analysis,
@@ -112,7 +114,7 @@ def run_job(job_id: str) -> None:
     return structured responses.  See the TODO in each _record_usage call.
     """
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
+    model = os.getenv("LLM_MODEL", "gemini-3.6-flash")
 
     db = SessionLocal()
     try:
@@ -156,7 +158,7 @@ def run_job(job_id: str) -> None:
 
             parsed_resume = _load_json_col(job.parsed_resume)
             parsed_jd = _load_json_col(job.parsed_jd)
-            ats_data = _step_ats_analysis(parsed_resume, parsed_jd, usage_callback=_cb("ats_analysis"))
+            ats_data = _deterministic_ats_analysis(parsed_resume, parsed_jd)
             job.ats_data = _dump(ats_data)
             db.commit()
 
@@ -195,13 +197,10 @@ def run_job(job_id: str) -> None:
             gap_analysis = ats_data.get("gap_analysis") or []
             keyword_analysis = ats_data.get("keyword_analysis") or {}
 
-            rescore_data = _step_rescore(
+            rescore_data = _deterministic_rescore(
                 tailored_data,
                 parsed_jd,
                 original_score,
-                gap_analysis,
-                keyword_analysis,
-                usage_callback=_cb("rescore"),
             )
             job.rescore_data = _dump(rescore_data)
             db.commit()

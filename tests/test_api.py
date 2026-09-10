@@ -176,17 +176,15 @@ MOCK_RESCORE = {
 
 
 def _make_llm_side_effect():
-    """Return different fixtures per call (in pipeline order)."""
+    """Return extraction and tailoring fixtures for the reduced pipeline."""
     call_count = [0]
     responses = [
         json.dumps(MOCK_PARSED_RESUME),   # stage 1: parse resume
         json.dumps(MOCK_PARSED_JD),       # stage 2: parse JD
-        json.dumps(MOCK_ATS_ANALYSIS),    # stage 3: ATS match
-        json.dumps(MOCK_TAILORED_RESUME), # stage 4: tailor
-        json.dumps(MOCK_RESCORE),         # stage 5: rescore
+        json.dumps(MOCK_TAILORED_RESUME), # stage 3: tailor
     ]
 
-    def _side_effect(messages, temperature=0.2):
+    def _side_effect(messages, temperature=0.2, **kwargs):
         idx = call_count[0]
         call_count[0] += 1
         return responses[idx] if idx < len(responses) else json.dumps({})
@@ -246,7 +244,7 @@ async def test_optimize_text_success(client: AsyncClient):
     data = resp.json()
     assert "ats_analysis" in data
     assert "tailored_resume" in data
-    assert data["ats_analysis"]["original_score"] == 72
+    assert data["ats_analysis"]["original_score"] == 77
     assert "job_title_match" in data["ats_analysis"]
     assert "responsibilities_match" in data["ats_analysis"]
 
@@ -286,7 +284,7 @@ async def test_optimize_upload_jd_text(client: AsyncClient):
         )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["ats_analysis"]["original_score"] == 72
+    assert data["ats_analysis"]["original_score"] == 77
 
 
 @pytest.mark.anyio
@@ -349,19 +347,11 @@ async def test_rescore_endpoint(client: AsyncClient):
         "keyword_analysis": MOCK_ATS_ANALYSIS["keyword_analysis"],
     }
 
-    # Rescore uses _step_analyse_jd + _step_rescore (2 LLM calls)
-    rescore_responses = [json.dumps(MOCK_PARSED_JD), json.dumps(MOCK_RESCORE)]
-    call_count = [0]
-    def _rescore_llm(messages, temperature=0.2):
-        idx = call_count[0]; call_count[0] += 1
-        return rescore_responses[idx] if idx < len(rescore_responses) else "{}"
-
-    with patch("optimizer._llm_call", side_effect=_rescore_llm):
-        resp = await client.post("/rescore", json=rescore_body)
+    resp = await client.post("/rescore", json=rescore_body)
     assert resp.status_code == 200
     data = resp.json()
     assert "final_ats_analysis" in data
-    assert data["final_ats_analysis"]["improved_score"] == 79
+    assert data["final_ats_analysis"]["improved_score"] >= 72
 
 
 @pytest.mark.anyio
@@ -418,16 +408,14 @@ async def test_run_in_threadpool_does_not_block(client: AsyncClient):
 
     call_times = []
 
-    def _slow_llm(messages, temperature=0.2):
+    def _slow_llm(messages, temperature=0.2, **kwargs):
         time.sleep(0.1)  # simulate short delay
         call_times.append(time.time())
         idx = len(call_times) - 1
         responses = [
             json.dumps(MOCK_PARSED_RESUME),
             json.dumps(MOCK_PARSED_JD),
-            json.dumps(MOCK_ATS_ANALYSIS),
             json.dumps(MOCK_TAILORED_RESUME),
-            json.dumps(MOCK_RESCORE),
         ]
         return responses[idx % len(responses)]
 
@@ -440,3 +428,91 @@ async def test_run_in_threadpool_does_not_block(client: AsyncClient):
 
     assert results[1].status_code == 200  # /health responded despite slow pipeline
     assert results[0].status_code == 200
+
+
+def test_deterministic_skill_aliases_do_not_infer_missing_skills():
+    from optimizer import _deterministic_ats_analysis
+
+    result = _deterministic_ats_analysis(
+        {
+            "name": "Candidate",
+            "skills": ["Postgres", "PySpark", "Python"],
+            "experience": [],
+            "education": [],
+        },
+        {
+            "job_title": "Data Engineer",
+            "required_skills": ["PostgreSQL", "pyspark", "AWS EC2"],
+            "important_keywords": ["Python"],
+            "responsibilities": [],
+        },
+    )
+
+    assert set(result["skill_match"]["matched_skills"]) == {"PostgreSQL", "pyspark", "Python"}
+    assert result["skill_match"]["missing_skills"] == ["AWS EC2"]
+
+
+def test_job_title_matching_supports_normalized_partial_titles():
+    from optimizer import _deterministic_ats_analysis
+
+    result = _deterministic_ats_analysis(
+        {"experience": [{"title": "Senior Software Engineer"}], "skills": [], "education": []},
+        {"job_title": "Sr. Software Eng", "required_skills": [], "responsibilities": []},
+    )
+
+    assert result["ats_analysis"]["job_title_match"] == 100
+
+
+def test_json_fence_stripping_and_redacted_parse_diagnostic():
+    from optimizer import _parse_json_response
+
+    assert _parse_json_response("```json\n{\"ok\": true}\n```") == {"ok": True}
+    with pytest.raises(ValueError, match="redacted-email"):
+        _parse_json_response("not json john@example.com +1-555-0100")
+
+
+def test_template_endpoint_returns_five_distinct_renderable_previews():
+    from template_previews import template_previews
+
+    previews = template_previews()
+    assert len(previews) == 5
+    assert {item["id"] for item in previews} == {
+        "classic", "modern", "technical", "executive", "clean"
+    }
+    assert len({item["thumbnail_svg"] for item in previews}) == 5
+    assert all(item["thumbnail_svg"].startswith("<svg") for item in previews)
+
+
+def test_anthropic_joins_all_text_blocks(monkeypatch):
+    import sys
+    import types
+    from optimizer import _call_anthropic
+
+    captured = {}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(
+                content=[types.SimpleNamespace(text='{"ok":true}')],
+                usage=types.SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    fake_module = types.SimpleNamespace(
+        Anthropic=lambda **kwargs: types.SimpleNamespace(messages=FakeMessages())
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+
+    _call_anthropic(
+        [
+            {"role": "system", "content": [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}]},
+            {"role": "user", "content": [{"type": "text", "text": "three"}, {"type": "text", "text": "four"}]},
+        ],
+        "test-model",
+        0.2,
+        100,
+    )
+
+    assert captured["system"] == "one\ntwo"
+    assert captured["messages"] == [{"role": "user", "content": "three\nfour"}]

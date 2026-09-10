@@ -190,3 +190,53 @@ class UsageRecord(Base):
             f"<UsageRecord job={self.job_id!r} stage={self.stage!r} "
             f"in={self.prompt_tokens} out={self.completion_tokens}>"
         )
+
+
+# ---------------------------------------------------------------------------
+# Anonymous Resume Maker phase tables
+# ---------------------------------------------------------------------------
+
+class ResumeRecord(Base):
+    __tablename__ = "resumes"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    session_id = Column(String(128), nullable=False, index=True)
+    raw_text = Column(Text, nullable=False)
+    parsed_structure = Column(Text, nullable=True)
+    uploaded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class JobDescriptionRecord(Base):
+    __tablename__ = "job_descriptions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    session_id = Column(String(128), nullable=False, index=True)
+    raw_text = Column(Text, nullable=False)
+    parsed_keywords = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AnalysisRecord(Base):
+    __tablename__ = "analyses"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    session_id = Column(String(128), nullable=False, index=True)
+    resume_id = Column(UUID(as_uuid=False), ForeignKey("resumes.id"), nullable=False)
+    job_description_id = Column(UUID(as_uuid=False), ForeignKey("job_descriptions.id"), nullable=False)
+    input_hash = Column(String(64), nullable=False, unique=True, index=True)
+    matched_skills = Column(Text, nullable=False, default="[]")
+    missing_skills = Column(Text, nullable=False, default="[]")
+    keyword_match_percentage = Column(Integer, nullable=False, default=0)
+    ats_score_breakdown = Column(Text, nullable=False, default="{}")
+    response_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class GeneratedResumeRecord(Base):
+    __tablename__ = "generated_resumes"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    analysis_id = Column(UUID(as_uuid=False), ForeignKey("analyses.id"), nullable=False, index=True)
+    template_id = Column(String(50), nullable=False)
+    tailored_content = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

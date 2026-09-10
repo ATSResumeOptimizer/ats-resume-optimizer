@@ -34,8 +34,14 @@ class RequirementClassification(str, Enum):
 
 class OutputFormat(str, Enum):
     JSON = "json"
-    # MARKDOWN variant removed — not yet implemented; will be added when
-    # a Markdown export path is wired end-to-end.
+
+
+class ResumeTemplate(str, Enum):
+    CLASSIC = "classic"
+    MODERN = "modern"
+    TECHNICAL = "technical"
+    EXECUTIVE = "executive"
+    CLEAN = "clean"
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +82,11 @@ class OptimizeRequest(BaseModel):
     )
     output_format: OutputFormat = Field(
         OutputFormat.JSON,
-        description="Preferred output format for the tailored resume content.",
+        description="JSON is the only supported output format. Markdown export is not implemented.",
+    )
+    resume_template: ResumeTemplate = Field(
+        ResumeTemplate.CLASSIC,
+        description="ATS-friendly presentation template selected by the user.",
     )
 
 
@@ -131,6 +141,19 @@ class OptimizationChange(BaseModel):
     description: str
 
 
+class ExperienceBulletChange(BaseModel):
+    company: str
+    title: str
+    before: str
+    after: str
+
+
+class ResumeComparison(BaseModel):
+    original_summary: str = ""
+    tailored_summary: str = ""
+    changed_experience_bullets: list[ExperienceBulletChange] = []
+
+
 class ExperienceEntry(BaseModel):
     company: str
     title: str
@@ -165,6 +188,7 @@ class SkillGroup(BaseModel):
 
 
 class TailoredResume(BaseModel):
+    contact: dict[str, str] = {}
     summary: str
     skills: list[SkillGroup] = []
     experience: list[ExperienceEntry] = []
@@ -185,12 +209,22 @@ class KeywordAnalysis(BaseModel):
     missing_keywords: list[str] = []
 
 
+class SkillMatchAnalysis(BaseModel):
+    matched_skills: list[str] = []
+    missing_skills: list[str] = []
+    job_keywords: list[str] = []
+    resume_skills: list[str] = []
+    keyword_match_percentage: int = Field(0, ge=0, le=100)
+
+
 # ---------------------------------------------------------------------------
 # Top-level response model
 # ---------------------------------------------------------------------------
 
 class OptimizeResponse(BaseModel):
     candidate: dict[str, str]
+
+    selected_template: ResumeTemplate = ResumeTemplate.CLASSIC
 
     ats_analysis: ATSScores
 
@@ -202,9 +236,13 @@ class OptimizeResponse(BaseModel):
 
     tailored_resume: TailoredResume
 
+    comparison: ResumeComparison = Field(default_factory=ResumeComparison)
+
     final_ats_analysis: FinalATSAnalysis
 
     keyword_analysis: KeywordAnalysis
+
+    skill_match: SkillMatchAnalysis = Field(default_factory=SkillMatchAnalysis)
 
     warnings: list[str] = []
 

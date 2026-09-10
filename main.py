@@ -72,7 +72,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_db()
 
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
+    model = os.getenv("LLM_MODEL", "gemini-3.6-flash")
 
     # Warn loudly at startup if the required API key is missing
     key_map = {
