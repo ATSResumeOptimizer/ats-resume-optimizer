@@ -29,7 +29,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from optimizer import run_optimization, run_rescore
@@ -40,7 +40,18 @@ from schemas import (
     OutputFormat,
     RescoreRequest,
     RescoreResponse,
+    ResumeTemplate,
 )
+from persistence import (
+    SESSION_COOKIE,
+    get_cached_response,
+    get_history,
+    new_session_id,
+    save_analysis,
+    session_id_from_cookie,
+)
+from progress import clear_stage, get_stage, set_stage
+from template_previews import template_previews
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +157,24 @@ def health() -> dict:
     return {"status": "healthy"}
 
 
+@router.get("/history", tags=["Meta"])
+def history(request: Request) -> list[OptimizeResponse]:
+    """Return recent analyses for the anonymous browser session."""
+    session_id = session_id_from_cookie(request.cookies.get(SESSION_COOKIE))
+    return get_history(session_id)
+
+
+@router.get("/templates", tags=["Meta"])
+def templates() -> list[dict[str, str]]:
+    """Return renderable previews for every supported resume template."""
+    return template_previews()
+
+
+@router.get("/progress", tags=["Meta"])
+def progress(request: Request) -> dict[str, str]:
+    return get_stage(session_id_from_cookie(request.cookies.get(SESSION_COOKIE)))
+
+
 # ---------------------------------------------------------------------------
 # POST /optimize  (JSON – plain text inputs)
 # ---------------------------------------------------------------------------
@@ -164,7 +193,7 @@ def health() -> dict:
     dependencies=[Depends(require_api_key)],
 )
 @_limiter.limit("10/minute")
-async def optimize_text(request: Request, body: OptimizeRequest) -> OptimizeResponse:
+async def optimize_text(request: Request, response: Response, body: OptimizeRequest) -> OptimizeResponse:
     """
     Run the full five-stage ATS optimization pipeline on text inputs.
 
@@ -173,7 +202,21 @@ async def optimize_text(request: Request, body: OptimizeRequest) -> OptimizeResp
     of sequential LLM calls.
     """
     try:
-        return await run_in_threadpool(run_optimization, body)
+        session_id = session_id_from_cookie(request.cookies.get(SESSION_COOKIE))
+        cached = get_cached_response(session_id, body.candidate_resume, body.job_description)
+        if cached:
+            return cached
+        session_id = session_id or new_session_id()
+        set_stage(session_id, "reading_resume")
+        result = await run_in_threadpool(
+            run_optimization,
+            body,
+            lambda stage: set_stage(session_id, stage),
+        )
+        save_analysis(session_id, body.candidate_resume, body.job_description, result)
+        clear_stage(session_id)
+        response.set_cookie(SESSION_COOKIE, session_id, httponly=True, samesite="lax", secure=False, max_age=60 * 60 * 24 * 90)
+        return result
     except (ValueError, RuntimeError) as exc:
         logger.exception("Pipeline error")
         raise HTTPException(
@@ -204,6 +247,7 @@ async def optimize_text(request: Request, body: OptimizeRequest) -> OptimizeResp
 @_limiter.limit("10/minute")
 async def optimize_upload(
     request: Request,
+    response: Response,
     resume_file: UploadFile = File(..., description="Resume file (PDF, DOCX, or TXT)"),
     jd_file: Optional[UploadFile] = File(
         None,
@@ -218,6 +262,7 @@ async def optimize_upload(
     preferred_resume_length: Optional[str] = Form(None),
     candidate_instructions: Optional[str] = Form(None),
     output_format: OutputFormat = Form(OutputFormat.JSON),
+    resume_template: ResumeTemplate = Form(ResumeTemplate.CLASSIC),
 ) -> OptimizeResponse:
     """
     Run the full five-stage ATS optimization pipeline on uploaded files.
@@ -285,6 +330,7 @@ async def optimize_upload(
             preferred_resume_length=preferred_resume_length,
             candidate_instructions=candidate_instructions,
             output_format=output_format,
+            resume_template=resume_template,
         )
     except Exception as exc:
         raise HTTPException(
@@ -294,7 +340,22 @@ async def optimize_upload(
 
     try:
         # ✅ Fixed: off-load blocking I/O-heavy pipeline to thread pool
-        return await run_in_threadpool(run_optimization, opt_request)
+        session_id = session_id_from_cookie(request.cookies.get(SESSION_COOKIE))
+        cached = get_cached_response(session_id, resume_text, jd_raw)
+        if cached:
+            return cached
+        session_id = session_id or new_session_id()
+        set_stage(session_id, "reading_resume")
+        result = await run_in_threadpool(
+            run_optimization,
+            opt_request,
+            lambda stage: set_stage(session_id, stage),
+        )
+        save_analysis(session_id, resume_text, jd_raw, result)
+        clear_stage(session_id)
+        if response is not None:
+            response.set_cookie(SESSION_COOKIE, session_id, httponly=True, samesite="lax", secure=False, max_age=60 * 60 * 24 * 90)
+        return result
     except (ValueError, RuntimeError) as exc:
         logger.exception("Pipeline error in /optimize/upload")
         raise HTTPException(

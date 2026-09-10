@@ -216,6 +216,7 @@ Given the original parsed resume, the parsed JD, and the gap analysis, produce
 a tailored resume as valid JSON:
 
 {
+  "contact": {"email": "", "phone": "", "linkedin": "", "github": "", "location": ""},
   "summary": "",
   "skills": [
     {"category": "Programming", "skills": ["Python", "SQL"]}

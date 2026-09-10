@@ -23,12 +23,13 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 from schemas import (
     ATSScores,
     CertificationEntry,
     EducationEntry,
+    ExperienceBulletChange,
     ExperienceEntry,
     FinalATSAnalysis,
     GapItem,
@@ -43,6 +44,8 @@ from schemas import (
     RequirementItem,
     RequirementStatus,
     Requirements,
+    ResumeComparison,
+    SkillMatchAnalysis,
     SkillGroup,
     TailoredResume,
 )
@@ -114,7 +117,7 @@ def _llm_call(
     Raises RuntimeError if no provider is configured.
     """
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
-    model = os.getenv("LLM_MODEL", "gemini-flash-latest")
+    model = os.getenv("LLM_MODEL", "gemini-3.6-flash")
 
     def _dispatch() -> tuple[str, int, int]:
         """Return (text, prompt_tokens, completion_tokens)."""
@@ -209,6 +212,7 @@ def _call_gemini(
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
+            "responseSchema": {"type": "OBJECT"},
         },
     }
     if system_parts:
@@ -306,19 +310,33 @@ def _call_anthropic(
         ) from exc
 
     # Anthropic uses a separate system param
-    system_text = ""
+    def _join_content(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for block in value:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(part for part in parts if part)
+        return str(value)
+
+    system_parts: list[str] = []
     user_messages: list[dict] = []
     for m in messages:
+        content = _join_content(m.get("content", ""))
         if m["role"] == "system":
-            system_text += m["content"] + "\n"
+            system_parts.append(content)
         else:
-            user_messages.append(m)
+            user_messages.append({"role": m["role"], "content": content})
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        system=system_text.strip(),
+        system="\n\n".join(part for part in system_parts if part).strip(),
         messages=user_messages,  # type: ignore[arg-type]
         temperature=temperature,
     )
@@ -552,21 +570,33 @@ def _parse_json_response(raw: str) -> dict:
     Extract a JSON object from *raw*, handling markdown code fences.
     Raises ValueError if no valid JSON is found.
     """
-    # Strip markdown fences if present
-    clean = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    # Strip one optional outer markdown fence without altering JSON strings.
+    clean = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", clean, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        clean = fenced.group(1).strip()
+    def _diagnostic_error() -> ValueError:
+        diagnostic = re.sub(
+            r"(?i)([\w.+-]+)@([\w.-]+\.[a-z]{2,})", "[redacted-email]", raw
+        )
+        diagnostic = re.sub(r"\b(?:\+?\d[\d\s().-]{7,}\d)\b", "[redacted-phone]", diagnostic)
+        diagnostic = diagnostic.replace("\r", " ").replace("\n", " ")
+        return ValueError(
+            "LLM did not return valid JSON "
+            f"(response length {len(raw)}; redacted prefix: {diagnostic[:120]!r})"
+        )
+
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
         # Try to find the first {...} block
         match = re.search(r"\{.*\}", clean, re.DOTALL)
         if match:
-            return json.loads(match.group())
-        # Limit to 120 chars — enough to diagnose the structure error without
-        # exposing resume/JD content (PII) in logs or error responses.
-        raise ValueError(
-            f"LLM did not return valid JSON. "
-            f"Response prefix (120 chars): {raw[:120]!r}"
-        )
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        raise _diagnostic_error()
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +661,195 @@ def _step_rescore(
     )
     raw = _llm_call(messages, max_tokens=1500, usage_callback=usage_callback)
     return _parse_json_response(raw)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic matching
+# ---------------------------------------------------------------------------
+
+_SKILL_ALIASES = {
+    "pyspark": "pyspark",
+    "postgres": "postgresql",
+    "postgresql": "postgresql",
+    "amazon ec2": "aws ec2",
+    "aws ec2": "aws ec2",
+    "amazon s3": "amazon s3",
+    "aws s3": "amazon s3",
+}
+
+_TITLE_ALIASES = {
+    "swe": "software engineer",
+    "sde": "software engineer",
+    "sr": "senior",
+    "jr": "junior",
+    "dev": "developer",
+    "eng": "engineer",
+    "mgr": "manager",
+    "vp": "vice president",
+}
+_TITLE_STOP_WORDS = {"and", "or", "of", "the", "a", "an", "to", "for"}
+
+_SKILL_VARIANTS = {
+    "postgresql": ("postgresql", "postgres"),
+    "aws ec2": ("aws ec2", "amazon ec2"),
+    "amazon s3": ("amazon s3", "aws s3"),
+}
+
+
+def _normalise_term(value: str) -> str:
+    compact = re.sub(r"[^a-z0-9+#.]", " ", value.lower())
+    compact = re.sub(r"\s+", " ", compact).strip()
+    return _SKILL_ALIASES.get(compact, compact)
+
+
+def _unique_terms(values: list) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        key = _normalise_term(value)
+        if key not in seen:
+            seen.add(key)
+            result.append(value.strip())
+    return result
+
+
+def _resume_search_text(parsed_resume: dict) -> str:
+    return json.dumps(parsed_resume, ensure_ascii=False).lower()
+
+
+def _jd_skill_terms(parsed_jd: dict) -> list[str]:
+    fields = (
+        "required_skills", "preferred_skills", "technical_skills",
+        "programming_languages", "tools", "cloud_technologies", "databases",
+        "frameworks", "methodologies", "certifications", "important_keywords",
+        "industry_terminology",
+    )
+    return _unique_terms([item for field in fields for item in _safe_list(parsed_jd, field)])
+
+
+def _resume_skill_terms(parsed_resume: dict) -> list[str]:
+    fields = (
+        "skills", "technical_skills", "programming_languages",
+        "tools_and_technologies",
+    )
+    return _unique_terms([item for field in fields for item in _safe_list(parsed_resume, field)])
+
+
+def _term_in_text(term: str, text: str) -> bool:
+    normalised = _normalise_term(term)
+    variants = _SKILL_VARIANTS.get(normalised, (normalised,))
+    return bool(normalised) and any(
+        re.search(rf"(?<![a-z0-9]){re.escape(variant)}(?![a-z0-9])", text)
+        for variant in variants
+    )
+
+
+def _normalise_title(value: str) -> list[str]:
+    words = re.findall(r"[a-z0-9+#.]+", value.lower())
+    normalised: list[str] = []
+    for word in words:
+        word = word.strip(".")
+        expanded = _TITLE_ALIASES.get(word, word)
+        if expanded not in _TITLE_STOP_WORDS:
+            normalised.extend(expanded.split())
+    return normalised
+
+
+def _title_match_score(job_title: str, resume_titles: list[str]) -> int:
+    target = set(_normalise_title(job_title))
+    if not target:
+        return 0
+    best = 0.0
+    for title in resume_titles:
+        candidate = set(_normalise_title(title))
+        if not candidate:
+            continue
+        overlap = len(target & candidate) / len(target)
+        # A title containing the target terms is a stronger match than a
+        # coincidental single-token overlap.
+        best = max(best, overlap)
+    return round(best * 100)
+
+
+def _deterministic_ats_analysis(parsed_resume: dict, parsed_jd: dict) -> dict:
+    resume_text = _resume_search_text(parsed_resume)
+    jd_skills = _jd_skill_terms(parsed_jd)
+    resume_skills = _resume_skill_terms(parsed_resume)
+    matched = [skill for skill in jd_skills if _term_in_text(skill, resume_text)]
+    missing = [skill for skill in jd_skills if skill not in matched]
+    keyword_match = round(len(matched) / len(jd_skills) * 100) if jd_skills else 0
+
+    resume_titles = [
+        str(item.get("title", ""))
+        for item in _safe_list(parsed_resume, "experience")
+        if isinstance(item, dict)
+    ]
+    title_match = _title_match_score(_safe_str(parsed_jd, "job_title"), resume_titles)
+
+    responsibilities = _safe_list(parsed_jd, "responsibilities")
+    experience_text = json.dumps(parsed_resume.get("experience", []), ensure_ascii=False).lower()
+    responsibility_hits = sum(1 for item in responsibilities if any(
+        word in experience_text for word in re.findall(r"[a-z0-9]+", str(item).lower()) if len(word) > 4
+    ))
+    responsibility_match = round(responsibility_hits / len(responsibilities) * 100) if responsibilities else 0
+    formatting_score = 100 if all(_safe_str(parsed_resume, field) or _safe_list(parsed_resume, field) for field in ("name", "skills", "experience", "education")) else 75
+    skills_match = keyword_match
+    experience_match = min(100, round((responsibility_match + keyword_match) / 2))
+    education_match = 100 if _safe_list(parsed_resume, "education") and (_safe_list(parsed_jd, "education_requirements") or not _safe_list(parsed_jd, "education_requirements")) else 0
+    original_score = round(
+        keyword_match * 0.30 + skills_match * 0.20 + experience_match * 0.15
+        + title_match * 0.10 + responsibility_match * 0.10
+        + education_match * 0.05 + formatting_score * 0.05
+    )
+
+    matched_items = [{"requirement": item, "classification": "REQUIRED", "importance": "HIGH"} for item in matched]
+    missing_items = [{"requirement": item, "classification": "REQUIRED", "importance": "HIGH"} for item in missing]
+    gaps = [
+        {
+            "requirement": item,
+            "classification": "REQUIRED",
+            "status": "MATCHED" if item in matched else "MISSING",
+            "resume_evidence": "Found in the extracted resume skills/text." if item in matched else "None found",
+            "recommended_action": "Prioritize existing evidence in the tailored resume." if item in matched else "Do not add this skill unless it is genuinely present in the original resume.",
+        }
+        for item in jd_skills
+    ]
+    return {
+        "ats_analysis": {
+            "original_score": original_score,
+            "keyword_match": keyword_match,
+            "skills_match": skills_match,
+            "experience_match": experience_match,
+            "job_title_match": title_match,
+            "responsibilities_match": responsibility_match,
+            "education_match": education_match,
+            "formatting_score": formatting_score,
+        },
+        "requirements": {"matched": matched_items, "partially_matched": [], "missing": missing_items},
+        "gap_analysis": gaps,
+        "keyword_analysis": {"matched_keywords": matched, "added_keywords": [], "missing_keywords": missing},
+        "skill_match": {
+            "matched_skills": matched,
+            "missing_skills": missing,
+            "job_keywords": jd_skills,
+            "resume_skills": resume_skills,
+            "keyword_match_percentage": keyword_match,
+        },
+    }
+
+
+def _deterministic_rescore(tailored_resume: dict, parsed_jd: dict, original_score: int) -> dict:
+    parsed_resume = {"skills": [], "technical_skills": [], "raw_text": json.dumps(tailored_resume, ensure_ascii=False)}
+    analysis = _deterministic_ats_analysis(parsed_resume, parsed_jd)
+    improved = max(original_score, int(analysis["ats_analysis"]["original_score"]))
+    return {
+        "final_ats_analysis": {"improved_score": improved, "remaining_gaps": analysis["skill_match"]["missing_skills"]},
+        "optimization_changes": [],
+        "keyword_analysis": analysis["keyword_analysis"],
+        "warnings": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -781,12 +1000,46 @@ def _build_tailored_resume(data: dict) -> TailoredResume:
         )
 
     return TailoredResume(
+        contact={str(k): str(v) for k, v in (data.get("contact") or {}).items() if v},
         summary=_safe_str(data, "summary"),
         skills=skills,
         experience=experience,
         projects=projects,
         education=education,
         certifications=certifications,
+    )
+
+
+def _build_comparison(original: dict, tailored: dict) -> ResumeComparison:
+    changes: list[ExperienceBulletChange] = []
+    original_experience = _safe_list(original, "experience")
+    tailored_experience = _safe_list(tailored, "experience")
+    for index, after_entry in enumerate(tailored_experience):
+        if not isinstance(after_entry, dict):
+            continue
+        before_entry = (
+            original_experience[index]
+            if index < len(original_experience) and isinstance(original_experience[index], dict)
+            else {}
+        )
+        before_bullets = _safe_list(before_entry, "bullets")
+        after_bullets = _safe_list(after_entry, "bullets")
+        for bullet_index in range(max(len(before_bullets), len(after_bullets))):
+            before = str(before_bullets[bullet_index]) if bullet_index < len(before_bullets) else ""
+            after = str(after_bullets[bullet_index]) if bullet_index < len(after_bullets) else ""
+            if before != after:
+                changes.append(
+                    ExperienceBulletChange(
+                        company=_safe_str(after_entry, "company", _safe_str(before_entry, "company")),
+                        title=_safe_str(after_entry, "title", _safe_str(before_entry, "title")),
+                        before=before,
+                        after=after,
+                    )
+                )
+    return ResumeComparison(
+        original_summary=_safe_str(original, "summary"),
+        tailored_summary=_safe_str(tailored, "summary"),
+        changed_experience_bullets=changes,
     )
 
 
@@ -828,22 +1081,16 @@ def run_rescore(request: "RescoreRequest") -> "RescoreResponse":
 
     logger.info("Starting lightweight re-score")
 
-    # Re-parse the JD so the LLM has the full structured context
-    parsed_jd_dict = _step_analyse_jd(request.job_description)
-
-    # Serialise the tailored resume dict for the LLM
     tailored_dict = request.tailored_resume.model_dump()
-
-    gap_analysis_list = [g.model_dump() for g in request.gap_analysis]
+    parsed_jd = {
+        "important_keywords": [
+            *request.keyword_analysis.matched_keywords,
+            *request.keyword_analysis.missing_keywords,
+        ],
+        "raw_text": request.job_description,
+    }
+    rescore_data = _deterministic_rescore(tailored_dict, parsed_jd, request.original_score)
     keyword_analysis_dict = request.keyword_analysis.model_dump()
-
-    rescore_data = _step_rescore(
-        tailored_dict,
-        parsed_jd_dict,
-        request.original_score,
-        gap_analysis_list,
-        keyword_analysis_dict,
-    )
 
     merged_ka = {
         **keyword_analysis_dict,
@@ -862,7 +1109,10 @@ def run_rescore(request: "RescoreRequest") -> "RescoreResponse":
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
+def run_optimization(
+    request: OptimizeRequest,
+    progress_callback: Callable[[str], None] | None = None,
+) -> OptimizeResponse:
     """
     Execute the full five-stage ATS optimization pipeline.
 
@@ -877,6 +1127,8 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
         Fully structured JSON-serialisable response.
     """
     logger.info("Starting ATS optimization pipeline")
+    if progress_callback:
+        progress_callback("reading_resume")
 
     # -------------------------------------------------------------------
     # Stage 1 + 2 – Parse resume AND analyse JD in parallel (independent)
@@ -885,12 +1137,14 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_resume = pool.submit(_step_parse_resume, request.candidate_resume)
         # Stagger by 2 s so both calls don't hit the free-tier endpoint simultaneously
-        future_jd = pool.submit(_step_analyse_jd, request.job_description, 2.0)
+        future_jd = pool.submit(_step_analyse_jd, request.job_description)
         parsed_resume_dict = future_resume.result()
         parsed_jd_dict = future_jd.result()
 
     parsed_resume_dict["raw_text"] = request.candidate_resume
     parsed_jd_dict["raw_text"] = request.job_description
+    if progress_callback:
+        progress_callback("analyzing_job_description")
 
     # Override job title from optional input
     if request.target_job_title:
@@ -900,7 +1154,9 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
     # Stage 3 – ATS match + gap analysis
     # -------------------------------------------------------------------
     logger.info("Stage 3: Running ATS analysis")
-    ats_data = _step_ats_analysis(parsed_resume_dict, parsed_jd_dict)
+    ats_data = _deterministic_ats_analysis(parsed_resume_dict, parsed_jd_dict)
+    if progress_callback:
+        progress_callback("matching_skills")
 
     original_score = int(
         (ats_data.get("ats_analysis") or {}).get("original_score", 0)
@@ -912,6 +1168,8 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
     # Stage 4 – Tailor resume
     # -------------------------------------------------------------------
     logger.info("Stage 4: Tailoring resume")
+    if progress_callback:
+        progress_callback("optimizing_resume")
     tailored_dict = _step_tailor_resume(
         parsed_resume_dict,
         parsed_jd_dict,
@@ -919,18 +1177,20 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
         candidate_instructions=request.candidate_instructions or "",
         preferred_length=request.preferred_resume_length or "",
     )
+    if progress_callback:
+        progress_callback("generating_final_resume")
 
     # -------------------------------------------------------------------
     # Stage 5 – Re-score
     # -------------------------------------------------------------------
     logger.info("Stage 5: Re-scoring")
-    rescore_data = _step_rescore(
+    rescore_data = _deterministic_rescore(
         tailored_dict,
         parsed_jd_dict,
         original_score,
-        gap_analysis_list,
-        keyword_analysis_dict,
     )
+    if progress_callback:
+        progress_callback("calculating_ats_score")
 
     # Merge keyword_analysis from rescore if available
     if rescore_data.get("keyword_analysis"):
@@ -951,15 +1211,18 @@ def run_optimization(request: OptimizeRequest) -> OptimizeResponse:
 
     response = OptimizeResponse(
         candidate={"name": candidate_name, "target_role": target_role},
+        selected_template=request.resume_template,
         ats_analysis=_build_ats_scores(ats_data),
         requirements=_build_requirements(ats_data),
         gap_analysis=_build_gap_analysis(ats_data),
         optimization_changes=_build_optimization_changes(rescore_data),
         tailored_resume=_build_tailored_resume(tailored_dict),
+        comparison=_build_comparison(parsed_resume_dict, tailored_dict),
         final_ats_analysis=_build_final_analysis(rescore_data, original_score),
         keyword_analysis=_build_keyword_analysis(
             {"keyword_analysis": merged_ka}
         ),
+        skill_match=SkillMatchAnalysis(**(ats_data.get("skill_match") or {})),
         warnings=[str(w) for w in _safe_list(rescore_data, "warnings")],
     )
 

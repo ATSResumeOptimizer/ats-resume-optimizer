@@ -39,6 +39,7 @@ from optimizer import (
     _build_gap_analysis,
     _build_keyword_analysis,
     _build_optimization_changes,
+    _build_comparison,
     _build_requirements,
     _build_tailored_resume,
     _safe_list,
@@ -46,7 +47,7 @@ from optimizer import (
     _load_json_col,
 )
 from parser import extract_text_from_bytes
-from schemas import OptimizeRequest, OptimizeResponse, OutputFormat
+from schemas import OptimizeRequest, OptimizeResponse, OutputFormat, ResumeTemplate, SkillMatchAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +199,18 @@ def _assemble_result(job: Job) -> dict:
             "name": _safe_str(parsed_resume, "name", "Unknown"),
             "target_role": parsed_jd.get("job_title") or "",
         },
+        selected_template=ResumeTemplate(
+            _load_json_col(job.request_params).get("resume_template", ResumeTemplate.CLASSIC.value)
+        ),
         ats_analysis=_build_ats_scores(ats_data),
         requirements=_build_requirements(ats_data),
         gap_analysis=_build_gap_analysis(ats_data),
         optimization_changes=_build_optimization_changes(rescore_data),
         tailored_resume=_build_tailored_resume(tailored_data),
+        comparison=_build_comparison(parsed_resume, tailored_data),
         final_ats_analysis=_build_final_analysis(rescore_data, original_score),
         keyword_analysis=_build_keyword_analysis({"keyword_analysis": keyword_analysis_dict}),
+        skill_match=SkillMatchAnalysis(**(ats_data.get("skill_match") or {})),
         warnings=[str(w) for w in _safe_list(rescore_data, "warnings")],
     )
     return response.model_dump()

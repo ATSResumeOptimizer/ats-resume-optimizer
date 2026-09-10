@@ -47,10 +47,12 @@ def extract_text_from_bytes(filename: str, data: bytes) -> str:
 
     if suffix == ".pdf":
         return _extract_pdf(data)
-    elif suffix in (".docx", ".doc"):
+    elif suffix == ".docx":
         return _extract_docx(data)
     elif suffix in (".txt", ".text", ""):
         return data.decode("utf-8", errors="replace")
+    elif suffix == ".doc":
+        raise ValueError("Legacy .doc files are not supported. Please save the file as .docx or PDF.")
     else:
         raise ValueError(
             f"Unsupported file type '{suffix}'. "
@@ -96,4 +98,10 @@ def _extract_docx(data: bytes) -> str:
 
     doc = Document(io.BytesIO(data))
     paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-    return "\n".join(paragraphs).strip()
+    table_rows = [
+        " | ".join(cell.text.strip() for cell in row.cells)
+        for table in doc.tables
+        for row in table.rows
+        if any(cell.text.strip() for cell in row.cells)
+    ]
+    return "\n".join([*paragraphs, *table_rows]).strip()

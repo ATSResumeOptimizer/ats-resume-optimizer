@@ -35,8 +35,7 @@ httpx>=0.28.0
 
 # ── Database (multi-tenant B2B layer) ────────────────────────────────────────
 sqlalchemy>=2.0.0
-# PostgreSQL driver (uncomment when using DATABASE_URL=postgresql://...):
-# psycopg2-binary>=2.9.0
+psycopg2-binary>=2.9.0
 
 # ── Async job queue ───────────────────────────────────────────────────────────
 rq>=1.16.0          # Redis Queue — task broker for the worker process
